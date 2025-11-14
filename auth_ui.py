@@ -1,18 +1,25 @@
+# auth_ui2.py — UI de autenticación: login, sign-up, cambio de contraseña, logout
 import re
 import streamlit as st
 from datetime import datetime, timedelta, timezone
-
 import db  # capa SQLite
 
-# Políticas (UI / sesión)
+# --- Rerun compatible con todas las versiones de Streamlit ---
+def _rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()  # versiones antiguas
+        except Exception:
+            pass
+
+# Políticas UI/sesión
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
-
 GLOBAL_MAX_FAILED_ATTEMPTS = 12
 GLOBAL_LOCK_MINUTES = 15
-
 PASSWORD_EXPIRY_DAYS = 90  # 0 para desactivar
-
 
 # ---------- Utilidades ----------
 def now_utc_iso() -> str:
@@ -27,14 +34,13 @@ def parse_iso(dt_str: str) -> datetime:
 def validate_password(password: str) -> bool:
     if len(password) < 8:
         return False
-    if not re.search(r"[A-Z]", password):               # al menos una mayúscula
+    if not re.search(r"[A-Z]", password):
         return False
-    if not re.search(r"[^A-Za-z0-9]", password):        # al menos un carácter especial
+    if not re.search(r"[^A-Za-z0-9]", password):
         return False
     return True
 
-
-# ---------- Guardas globales (por sesión de navegador) ----------
+# ---------- Guardas globales ----------
 def init_global_guard():
     if "global_failed_attempts" not in st.session_state:
         st.session_state["global_failed_attempts"] = 0
@@ -48,7 +54,7 @@ def is_global_locked() -> tuple[bool, str | None]:
         dt = parse_iso(lock_until)
         if datetime.now(timezone.utc) < dt.astimezone(timezone.utc):
             minutes_left = int((dt - datetime.now(timezone.utc)).total_seconds() // 60) + 1
-            return True, f"Acceso global bloqueado. Intenta de nuevo en ~{minutes_left} min."
+            return True, f"Acceso global bloqueado. Intenta en ~{minutes_left} min."
         else:
             st.session_state["global_lock_until"] = None
             st.session_state["global_failed_attempts"] = 0
@@ -68,8 +74,7 @@ def reset_global_fail():
     st.session_state["global_failed_attempts"] = 0
     st.session_state["global_lock_until"] = None
 
-
-# ---------- Lock y expiración a nivel de usuario ----------
+# ---------- Lock y expiración por usuario ----------
 def is_locked(user_data: dict) -> tuple[bool, str | None]:
     lock_until = user_data.get("lock_until")
     if lock_until:
@@ -77,9 +82,9 @@ def is_locked(user_data: dict) -> tuple[bool, str | None]:
             dt = parse_iso(lock_until)
             if datetime.now(timezone.utc) < dt.astimezone(timezone.utc):
                 minutes_left = int((dt - datetime.now(timezone.utc)).total_seconds() // 60) + 1
-                return True, f"Cuenta bloqueada por seguridad. Intenta de nuevo en ~{minutes_left} min."
+                return True, f"Cuenta bloqueada. Intenta en ~{minutes_left} min."
             else:
-                db.reset_failed_attempts(user_data["username"])  # limpiar en BD
+                db.reset_failed_attempts(user_data["username"])
                 return False, None
         except Exception:
             return False, None
@@ -97,7 +102,6 @@ def is_password_expired(user_data: dict) -> bool:
         return True
     return datetime.now(timezone.utc) >= (last_set.astimezone(timezone.utc) + timedelta(days=PASSWORD_EXPIRY_DAYS))
 
-
 # ---------- Sesión ----------
 def is_authenticated() -> bool:
     return bool(st.session_state.get("logged_in", False))
@@ -109,7 +113,6 @@ def _ensure_session_keys():
         st.session_state["role"] = None
         st.session_state["must_change_password"] = False
     init_global_guard()
-
 
 # ---------- UI: Sign-up ----------
 def show_signup():
@@ -147,11 +150,10 @@ def show_signup():
     ok, msg = db.create_user(new_user, new_pass, role)
     if ok:
         reset_global_fail()
-        st.success("✅ Usuario registrado con éxito. Ahora puedes iniciar sesión.")
+        st.success("✅ Usuario registrado. Ahora puedes iniciar sesión.")
     else:
         register_global_fail()
         st.error(msg or "⚠️ No se pudo crear el usuario.")
-
 
 # ---------- UI: Login ----------
 def show_login():
@@ -185,11 +187,9 @@ def show_login():
 
     ok, _ = db.authenticate(username, password)
     if not ok:
-        # incrementa contador usuario + global
         db.register_failed_attempt(username, MAX_FAILED_ATTEMPTS, LOCKOUT_MINUTES)
         register_global_fail()
 
-        # calcula restantes (usuario estimado y global actual)
         after_user = int(user_data.get("failed_attempts", 0)) + 1
         remaining_user = max(0, MAX_FAILED_ATTEMPTS - after_user)
         remaining_global = max(0, GLOBAL_MAX_FAILED_ATTEMPTS - st.session_state["global_failed_attempts"])
@@ -200,7 +200,6 @@ def show_login():
             st.error(f"❌ Credenciales incorrectas. Restantes → Usuario: {remaining_user} | Global: {remaining_global}")
         return
 
-    # OK → reset contadores
     db.reset_failed_attempts(username)
     reset_global_fail()
 
@@ -215,18 +214,14 @@ def show_login():
     st.session_state["username"] = username
     st.session_state["role"] = user_data.get("role", "Viewer")
     st.success(f"✅ Bienvenido {username}!")
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
-
+    _rerun()
 
 # ---------- UI: Cambio de contraseña ----------
 def show_change_password(username: str, force: bool = False):
     help_txt = "Tu contraseña ha expirado, cámbiala para continuar." if force else "Actualiza tu contraseña."
     with st.form("force_pw_change", clear_on_submit=False):
         st.info(help_txt)
-        current_pw = None if force else st.text_input("Contraseña actual (deja vacío si es por expiración)", type="password")
+        current_pw = None if force else st.text_input("Contraseña actual (déjala vacía si es por expiración)", type="password")
         new_pw     = st.text_input("Nueva contraseña", type="password")
         confirm_pw = st.text_input("Confirmar nueva contraseña", type="password")
         submitted  = st.form_submit_button("Actualizar")
@@ -239,7 +234,6 @@ def show_change_password(username: str, force: bool = False):
         st.error(f"⛔ {g_msg}")
         return
 
-    # si no es forzado por expiración, valida actual
     if not force:
         ok, _ = db.authenticate(username, current_pw or "")
         if not ok:
@@ -253,7 +247,7 @@ def show_change_password(username: str, force: bool = False):
         return
     if not validate_password(new_pw):
         register_global_fail()
-        st.error("⚠️ La nueva contraseña no cumple los requisitos: mínimo 8, una mayúscula y un carácter especial.")
+        st.error("⚠️ La nueva contraseña no cumple los requisitos (mín. 8, 1 mayúscula, 1 carácter especial).")
         return
 
     db.set_new_password(username, new_pw)
@@ -263,11 +257,7 @@ def show_change_password(username: str, force: bool = False):
     st.session_state["logged_in"] = True
     fresh = db.get_user(username)
     st.session_state["role"] = fresh.get("role", "Viewer") if fresh else "Viewer"
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
-
+    _rerun()
 
 # ---------- UI: Logout ----------
 def logout():
@@ -276,7 +266,4 @@ def logout():
     st.session_state["role"] = None
     st.session_state["must_change_password"] = False
     reset_global_fail()
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
+    _rerun()
