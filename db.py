@@ -1,27 +1,33 @@
+# db.py — SQLite: init, CRUD, auth, hashing PBKDF2 + entidad items
 import sqlite3, os, hashlib, hmac
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+import pandas as pd
 
 DB_PATH = Path("app.db")
 
-# Parámetros de hashing (alineados con auth_ui)
+# Hashing PBKDF2
 PBKDF2_ALGO = "sha256"
 PBKDF2_ITERATIONS = 200_000
 SALT_BYTES = 16
 
-
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
+def db_path() -> str:
+    return str(DB_PATH.resolve())
 
+# =========================
+# Init DB (users + items)
+# =========================
 def init_db():
     with get_conn() as conn:
-        # Opcional: mejora concurrencia si abres con DBeaver a la vez
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
         except Exception:
             pass
         c = conn.cursor()
+        # Tabla usuarios
         c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,10 +42,37 @@ def init_db():
             updated_at TEXT
         )
         """)
+        # Tabla items (SpendSense)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_by TEXT NOT NULL,
+            source TEXT CHECK(source IN ('original','second_hand')) NOT NULL DEFAULT 'original',
+            title TEXT NOT NULL,
+            brand TEXT,
+            price REAL NOT NULL,
+            origin TEXT,
+            material TEXT,
+            category TEXT,
+            image_path TEXT,
+            label_image_path TEXT,
+            co2_estimate REAL,
+            co2_level TEXT CHECK(co2_level IN ('low','medium','high')),
+            status TEXT CHECK(status IN ('in_cart','positive','negative')) NOT NULL DEFAULT 'in_cart',
+            action_type TEXT CHECK(action_type IN ('none','bought_original','saved_money','bought_second_hand')) NOT NULL DEFAULT 'none',
+            second_hand_price REAL,
+            savings REAL,
+            color TEXT,
+            confidence REAL,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT
+        )
+        """)
         conn.commit()
 
-
-# -------- hashing --------
+# =========================
+# Hash helpers
+# =========================
 def _hash_password(password: str) -> tuple[str, str]:
     salt = os.urandom(SALT_BYTES)
     pwd = hashlib.pbkdf2_hmac(PBKDF2_ALGO, password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
@@ -47,27 +80,18 @@ def _hash_password(password: str) -> tuple[str, str]:
 
 def _verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
     salt = bytes.fromhex(salt_hex)
-    expected = bytes.fromhex(hash_hex)  # bytes del hash guardado
-    got = hashlib.pbkdf2_hmac(
-        PBKDF2_ALGO,
-        password.encode("utf-8"),
-        salt,
-        PBKDF2_ITERATIONS,
-    )
-    # Comparación segura y constante en tiempo
+    expected = bytes.fromhex(hash_hex)
+    got = hashlib.pbkdf2_hmac(PBKDF2_ALGO, password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
     return hmac.compare_digest(got, expected)
 
-
-# -------- helpers --------
-def _row_to_dict(row):
+# =========================
+# Users CRUD / Auth
+# =========================
+def _user_row_to_dict(row):
     if not row:
         return None
-    cols = [
-        "id", "username", "role",
-        "salt_hex", "password_hash_hex",
-        "failed_attempts", "lock_until", "password_last_set",
-        "created_at", "updated_at",
-    ]
+    cols = ["id","username","role","salt_hex","password_hash_hex","failed_attempts",
+            "lock_until","password_last_set","created_at","updated_at"]
     return dict(zip(cols, row))
 
 def get_user(username: str) -> dict | None:
@@ -78,7 +102,7 @@ def get_user(username: str) -> dict | None:
                    lock_until, password_last_set, created_at, updated_at
             FROM users WHERE username = ?
         """, (username,))
-        return _row_to_dict(cur.fetchone())
+        return _user_row_to_dict(cur.fetchone())
 
 def create_user(username: str, password: str, role: str = "Viewer") -> tuple[bool, str | None]:
     try:
@@ -131,19 +155,6 @@ def reset_failed_attempts(username: str):
         """, (datetime.now(timezone.utc).isoformat(), username))
         conn.commit()
 
-def clear_lock_if_expired(username: str) -> bool:
-    u = get_user(username)
-    if not u or not u.get("lock_until"):
-        return False
-    try:
-        dt = datetime.fromisoformat(u["lock_until"])
-    except Exception:
-        return False
-    if datetime.now(timezone.utc) >= dt:
-        reset_failed_attempts(username)
-        return True
-    return False
-
 def set_new_password(username: str, new_password: str):
     salt, pwh = _hash_password(new_password)
     now = datetime.now(timezone.utc).isoformat()
@@ -157,7 +168,6 @@ def set_new_password(username: str, new_password: str):
         conn.commit()
 
 def seed_initial_users(seed: dict):
-    """seed = {'mario': {'password':'1234','role':'Admin'}, ...}"""
     with get_conn() as conn:
         cur = conn.cursor()
         for username, info in seed.items():
@@ -174,11 +184,116 @@ def seed_initial_users(seed: dict):
             """, (username, info.get("role","Viewer"), salt, pwh, now, now, now))
         conn.commit()
 
-def db_path() -> str:
-    return str(DB_PATH.resolve())
+def list_users_df() -> pd.DataFrame:
+    with get_conn() as conn:
+        df = pd.read_sql_query("""
+            SELECT id, username, role, failed_attempts, lock_until, password_last_set, created_at
+            FROM users ORDER BY id
+        """, conn)
+    return df
 
 def count_users() -> int:
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM users")
+        return c.fetchone()[0]
+
+# =========================
+# Items CRUD
+# =========================
+def _item_row_to_dict(row):
+    if not row:
+        return None
+    cols = [
+        "id", "created_by", "source", "title", "brand", "price", "origin", "material",
+        "category", "image_path", "label_image_path", "co2_estimate", "co2_level",
+        "status", "action_type", "second_hand_price", "savings", "color", "confidence",
+        "created_at", "updated_at"
+    ]
+    return dict(zip(cols, row))
+
+def create_item(created_by: str, source: str, title: str, price: float,
+                brand: str | None = None, origin: str | None = None,
+                material: str | None = None, category: str | None = None,
+                image_path: str | None = None, label_image_path: str | None = None,
+                co2_estimate: float | None = None, co2_level: str | None = None,
+                status: str = "in_cart", action_type: str = "none",
+                second_hand_price: float | None = None, savings: float | None = None,
+                color: str | None = None, confidence: float | None = None) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO items (created_by, source, title, brand, price, origin, material, category,
+                               image_path, label_image_path, co2_estimate, co2_level, status, action_type,
+                               second_hand_price, savings, color, confidence, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (created_by, source, title, brand, price, origin, material, category,
+              image_path, label_image_path, co2_estimate, co2_level, status, action_type,
+              second_hand_price, savings, color, confidence, now, now))
+        conn.commit()
+        return cur.lastrowid
+
+def get_item(item_id: int) -> dict | None:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, created_by, source, title, brand, price, origin, material, category,
+                   image_path, label_image_path, co2_estimate, co2_level, status, action_type,
+                   second_hand_price, savings, color, confidence, created_at, updated_at
+            FROM items WHERE id = ?
+        """, (item_id,))
+        return _item_row_to_dict(cur.fetchone())
+
+def update_item(item_id: int, **fields):
+    if not fields:
+        return
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    keys = ", ".join([f"{k} = ?" for k in fields.keys()])
+    vals = list(fields.values())
+    vals.append(item_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE items SET {keys} WHERE id = ?", vals)
+        conn.commit()
+
+def list_user_items(username: str, status: str | None = None, order_by: str = "-created_at") -> list[dict]:
+    order_sql = "created_at DESC" if order_by.startswith("-") else "created_at ASC"
+    with get_conn() as conn:
+        cur = conn.cursor()
+        if status:
+            cur.execute(f"""
+                SELECT id, created_by, source, title, brand, price, origin, material, category,
+                       image_path, label_image_path, co2_estimate, co2_level, status, action_type,
+                       second_hand_price, savings, color, confidence, created_at, updated_at
+                FROM items
+                WHERE created_by = ? AND status = ?
+                ORDER BY {order_sql}
+            """, (username, status))
+        else:
+            cur.execute(f"""
+                SELECT id, created_by, source, title, brand, price, origin, material, category,
+                       image_path, label_image_path, co2_estimate, co2_level, status, action_type,
+                       second_hand_price, savings, color, confidence, created_at, updated_at
+                FROM items
+                WHERE created_by = ?
+                ORDER BY {order_sql}
+            """, (username,))
+        rows = cur.fetchall()
+    return [_item_row_to_dict(r) for r in rows]
+
+def list_items_df() -> pd.DataFrame:
+    with get_conn() as conn:
+        df = pd.read_sql_query("""
+            SELECT id, created_by, source, title, brand, price, origin, material,
+                   category, co2_estimate, co2_level, status, action_type,
+                   second_hand_price, savings, color, confidence, created_at
+            FROM items ORDER BY id
+        """, conn)
+    return df
+
+def count_items() -> int:
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM items")
         return c.fetchone()[0]
